@@ -2,6 +2,70 @@ import os
 import sys
 import yt_dlp
 
+from tagger import TagAndFile
+
+
+def default_library():
+    """
+    Where MP3s go: $YT_MUSIC_DIR, else /srv/music/YouTube on the Pi, else ./downloads/music
+    """
+    if os.environ.get('YT_MUSIC_DIR'):
+        return os.environ['YT_MUSIC_DIR']
+    if os.path.isdir('/srv/music'):
+        return '/srv/music/YouTube'
+    return os.path.join(os.getcwd(), 'downloads', 'music')
+
+
+def download_youtube_audio(url, library=None):
+    """
+    Download a video or a whole playlist as tagged MP3s, filed as <library>/<Artist>/<Title>.mp3
+
+    Videos already downloaded once (listed in <library>/.archive.txt) are skipped,
+    so the same playlist can be run again to pick up only the new songs.
+
+    :param url: YouTube URL (video or playlist)
+    :param library: Music folder (optional, see default_library)
+    :return: Tuple of (filed MP3 paths, skipped videos)
+    """
+    library = library or default_library()
+    staging = os.path.join(library, '.incoming')
+    os.makedirs(staging, exist_ok=True)
+
+    filed = []
+    skipped = []
+
+    def note_errors(d):
+        if d['status'] == 'error':
+            skipped.append(d.get('info_dict', {}).get('title', 'Unknown video'))
+
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': os.path.join(staging, '%(id)s.%(ext)s'),
+        'progress_hooks': [download_progress, note_errors],
+        'download_archive': os.path.join(library, '.archive.txt'),
+        'writethumbnail': True,
+        'postprocessors': [
+            {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'},
+            {'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg', 'when': 'before_dl'},
+            {'key': 'EmbedThumbnail'},
+        ],
+        'no_color': True,
+        'ignoreerrors': True,  # Continue past private/removed videos in a playlist
+        'no_warnings': True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # 'after_move': yt-dlp's own MoveFiles step would otherwise move the file back into staging
+        ydl.add_post_processor(TagAndFile(library, filed), when='after_move')
+        ydl.download([url])
+
+    print(f"\nBoom ! {len(filed)} new song(s) filed in {library}")
+    if skipped:
+        print(f"Skipped (private or error): {len(skipped)}")
+        for title in set(skipped):
+            print(f"  - {title}")
+    return filed, skipped
+
 
 def download_youtube_content(url, output_path=None, resolution=None, download_type='video'):
     """
@@ -121,18 +185,29 @@ def main():
         print("  Single video: python playlist-downloader.py https://youtube.com/watch?v=xyz")
         print("  Playlist: python playlist-downloader.py https://youtube.com/playlist?list=xyz playlist")
         print("  With resolution: python playlist-downloader.py https://youtube.com/watch?v=xyz 720p")
+        print("  As tagged MP3s (song or playlist): python playlist-downloader.py <YouTube_URL> mp3 [--to=/music/folder]")
         sys.exit(1)
 
     video_url = sys.argv[1]
 
     resolution = None
     download_type = 'video'
+    audio = False
+    library = None
 
     for arg in sys.argv[2:]:
-        if arg.endswith('p'):
+        if arg.lower() == 'mp3':
+            audio = True
+        elif arg.startswith('--to='):
+            library = arg[len('--to='):]
+        elif arg.endswith('p'):
             resolution = arg
         elif arg.lower() == 'playlist':
             download_type = 'playlist'
+
+    if audio:
+        download_youtube_audio(video_url, library)
+        return
 
     downloaded_files, skipped_files = download_youtube_content(
         video_url,
